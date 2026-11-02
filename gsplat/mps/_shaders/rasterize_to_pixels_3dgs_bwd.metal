@@ -8,10 +8,8 @@
 // contributions, and atomic-adds them into per-gaussian gradient buffers.
 //
 // Differences from CUDA:
-//   * No warp-leader reduction: every active thread does its own
-//     `atomic_fetch_add` against `v_means2d` / `v_conics` / `v_colors` /
-//     `v_opacities`. Slower than the CUDA scheme, but trivially correct
-//     and a clean baseline to optimise from.
+//   * The gradients of each gaussian are summed over the SIMD group
+//     (simd_sum) before one atomic add, like CUDA's warp sum.
 //   * No threadgroup cache yet — each thread reads gaussian state directly
 //     from device memory. Stage 7.x can add a cache once the baseline is
 //     verified to match the torch reference within tolerance.
@@ -68,11 +66,11 @@ kernel void rasterize_to_pixels_3dgs_bwd(
     const uint tile_id = tg_id.y * tile_width + tg_id.x;
     const uint pix_x = gid.x;
     const uint pix_y = gid.y;
+    // No early return for pixels outside the image: the SIMD-group sums
+    // below need every lane. Those pixels have bin_final = -1, so they never
+    // contribute.
     const bool inside = (pix_x < image_width) && (pix_y < image_height);
-    if (!inside) {
-        return;
-    }
-    const uint pix_id = pix_y * image_width + pix_x;
+    const uint pix_id = inside ? pix_y * image_width + pix_x : 0u;
     const uint pix_base = image_id * image_height * image_width + pix_id;
 
     const uint tile_offset_idx = image_id * tile_height * tile_width + tile_id;
@@ -87,83 +85,103 @@ kernel void rasterize_to_pixels_3dgs_bwd(
     }
 
     // Per-pixel state from the forward.
-    const float T_final = 1.0f - render_alphas[pix_base];
+    const float T_final = inside ? 1.0f - render_alphas[pix_base] : 1.0f;
     float       T = T_final;
     float       buffer[CDIM];
     for (uint k = 0; k < CDIM; ++k) buffer[k] = 0.0f;
-    const int   bin_final = last_ids[pix_base];
+    const int   bin_final = inside ? last_ids[pix_base] : -1;
 
     // Upstream gradient for this pixel.
     float v_render_c[CDIM];
-    for (uint k = 0; k < CDIM; ++k) v_render_c[k] = v_render_colors[pix_base * CDIM + k];
-    const float v_render_a = v_render_alphas[pix_base];
+    for (uint k = 0; k < CDIM; ++k) {
+        v_render_c[k] = inside ? v_render_colors[pix_base * CDIM + k] : 0.0f;
+    }
+    const float v_render_a = inside ? v_render_alphas[pix_base] : 0.0f;
 
     const float px = (float)pix_x + 0.5f;
     const float py = (float)pix_y + 0.5f;
 
-    // Iterate back-to-front through gaussians that this pixel actually
-    // composited (idx <= bin_final). Going from `bin_final` down to
-    // `range_start` keeps the relationship T_n = T_{n+1} * 1/(1 - alpha_n)
-    // walking from "outermost" to "innermost".
-    for (int idx = bin_final; idx >= range_start; --idx) {
+    // Iterate back-to-front through the gaussians this pixel composited
+    // (idx <= bin_final), so that T_n = T_{n+1} / (1 - alpha_n) walks from
+    // the outermost to the innermost. All lanes of a SIMD group walk the same
+    // gaussians, starting from the last one any lane composited, so the
+    // gradients of one gaussian can be summed over the group and written with
+    // one atomic add, as CUDA's warp sum does.
+    const int idx_first = simd_max(bin_final);
+    for (int idx = idx_first; idx >= range_start; --idx) {
+        const bool valid = idx <= bin_final;
+        if (!simd_any(valid)) {
+            continue;
+        }
         const int g = flatten_ids[idx];
         const float2 xy = means2d[g];
         const float3 cn = conics[g];
         const float opac = opacities[g];
-
-        const float dx = xy.x - px;
-        const float dy = xy.y - py;
-        const float sigma = 0.5f * (cn.x * dx * dx + cn.z * dy * dy)
-                          + cn.y * dx * dy;
-        const float vis = exp(-sigma);
-        float alpha = min(MAX_ALPHA, opac * vis);
-        if (sigma < 0.0f) {
-            alpha = 0.0f;
-        }
-
-        // Rewind transmittance: T_at_g = T_after_g / (1 - alpha)
-        const float ra = 1.0f / max(MIN_ONE_MINUS_ALPHA, 1.0f - alpha);
-        T *= ra;
-        const float fac = alpha * T;
-
-        // Local gradient contributions for this (pixel, gaussian) pair.
-
-
-        float v_alpha = 0.0f;
         const uint c_off = (uint)g * CDIM;
-        for (uint k = 0; k < CDIM; ++k) {
-            v_alpha += (colors[c_off + k] * T - buffer[k] * ra) * v_render_c[k];
-        }
-        v_alpha += T_final * ra * v_render_a;
 
+        float v_rgb_local[CDIM];
+        for (uint k = 0; k < CDIM; ++k) v_rgb_local[k] = 0.0f;
         float v_opacity_local = 0.0f;
         float v_xy_local_x = 0.0f, v_xy_local_y = 0.0f;
         float v_conic_local_x = 0.0f, v_conic_local_y = 0.0f, v_conic_local_z = 0.0f;
-        if (opac * vis <= MAX_ALPHA) {
-            const float v_sigma = -opac * vis * v_alpha;
-            v_conic_local_x = 0.5f * v_sigma * dx * dx;
-            v_conic_local_y =        v_sigma * dx * dy;
-            v_conic_local_z = 0.5f * v_sigma * dy * dy;
-            v_xy_local_x = v_sigma * (cn.x * dx + cn.y * dy);
-            v_xy_local_y = v_sigma * (cn.y * dx + cn.z * dy);
-            v_opacity_local = vis * v_alpha;
+
+        if (valid) {
+            const float dx = xy.x - px;
+            const float dy = xy.y - py;
+            const float sigma = 0.5f * (cn.x * dx * dx + cn.z * dy * dy)
+                              + cn.y * dx * dy;
+            const float vis = exp(-sigma);
+            float alpha = min(MAX_ALPHA, opac * vis);
+            if (sigma < 0.0f) {
+                alpha = 0.0f;
+            }
+
+            // Rewind transmittance: T_at_g = T_after_g / (1 - alpha)
+            const float ra = 1.0f / max(MIN_ONE_MINUS_ALPHA, 1.0f - alpha);
+            T *= ra;
+            const float fac = alpha * T;
+
+            float v_alpha = 0.0f;
+            for (uint k = 0; k < CDIM; ++k) {
+                v_rgb_local[k] = fac * v_render_c[k];
+                v_alpha += (colors[c_off + k] * T - buffer[k] * ra) * v_render_c[k];
+            }
+            v_alpha += T_final * ra * v_render_a;
+
+            if (opac * vis <= MAX_ALPHA) {
+                const float v_sigma = -opac * vis * v_alpha;
+                v_conic_local_x = 0.5f * v_sigma * dx * dx;
+                v_conic_local_y =        v_sigma * dx * dy;
+                v_conic_local_z = 0.5f * v_sigma * dy * dy;
+                v_xy_local_x = v_sigma * (cn.x * dx + cn.y * dy);
+                v_xy_local_y = v_sigma * (cn.y * dx + cn.z * dy);
+                v_opacity_local = vis * v_alpha;
+            }
+
+            // Update the running back-buffer BEFORE the next iteration.
+            for (uint k = 0; k < CDIM; ++k) buffer[k] += colors[c_off + k] * fac;
         }
 
-        // Update the running back-buffer BEFORE the next iteration.
-        for (uint k = 0; k < CDIM; ++k) buffer[k] += colors[c_off + k] * fac;
-
-        // Scatter gradients atomically.
+        // Sum over the SIMD group; its first lane writes.
         for (uint k = 0; k < CDIM; ++k) {
-            atomic_fetch_add_explicit(v_colors + c_off + k, fac * v_render_c[k], memory_order_relaxed);
+            const float sum = simd_sum(v_rgb_local[k]);
+            if (simd_is_first()) {
+                atomic_fetch_add_explicit(v_colors + c_off + k, sum, memory_order_relaxed);
+            }
         }
-
-        atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 0, v_conic_local_x, memory_order_relaxed);
-        atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 1, v_conic_local_y, memory_order_relaxed);
-        atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 2, v_conic_local_z, memory_order_relaxed);
-
-        atomic_fetch_add_explicit(v_means2d + (uint)g * 2 + 0, v_xy_local_x, memory_order_relaxed);
-        atomic_fetch_add_explicit(v_means2d + (uint)g * 2 + 1, v_xy_local_y, memory_order_relaxed);
-
-        atomic_fetch_add_explicit(v_opacities + (uint)g, v_opacity_local, memory_order_relaxed);
+        const float s_c0 = simd_sum(v_conic_local_x);
+        const float s_c1 = simd_sum(v_conic_local_y);
+        const float s_c2 = simd_sum(v_conic_local_z);
+        const float s_x  = simd_sum(v_xy_local_x);
+        const float s_y  = simd_sum(v_xy_local_y);
+        const float s_o  = simd_sum(v_opacity_local);
+        if (simd_is_first()) {
+            atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 0, s_c0, memory_order_relaxed);
+            atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 1, s_c1, memory_order_relaxed);
+            atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 2, s_c2, memory_order_relaxed);
+            atomic_fetch_add_explicit(v_means2d + (uint)g * 2 + 0, s_x, memory_order_relaxed);
+            atomic_fetch_add_explicit(v_means2d + (uint)g * 2 + 1, s_y, memory_order_relaxed);
+            atomic_fetch_add_explicit(v_opacities + (uint)g, s_o, memory_order_relaxed);
+        }
     }
 }
