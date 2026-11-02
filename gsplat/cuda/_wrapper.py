@@ -967,11 +967,19 @@ def isect_offset_encode(
     Returns:
         Offsets. [I, tile_height, tile_width]
     """
-    from ._torch_impl import _isect_offset_encode
-
-    return _isect_offset_encode(
-        isect_ids.contiguous(), n_images, tile_width, tile_height
-    )
+    # The ids are sorted, so the offset of each tile is the index of the first
+    # id whose key (image, tile) is at least that tile's key: an empty tile gets
+    # the offset of the next one, as in CUDA. This replaces
+    # `_torch_impl._isect_offset_encode`, whose `unique_consecutive` took 1.9 s
+    # on MPS for 4M intersections (searchsorted: 2 ms).
+    tile_n_bits = (tile_width * tile_height).bit_length()
+    device = isect_ids.device
+    keys = isect_ids.contiguous() >> 32
+    queries = (torch.arange(n_images, device=device)[:, None] << tile_n_bits) | torch.arange(
+        tile_width * tile_height, device=device
+    )[None]
+    offsets = torch.searchsorted(keys, queries.reshape(-1))
+    return offsets.reshape(n_images, tile_height, tile_width).int()
 
 
 def rasterize_to_pixels(

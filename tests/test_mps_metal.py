@@ -190,6 +190,29 @@ def test_intersect_tile_metal_matches_torch():
     assert torch.equal(fid_t, fid_m), "flatten_ids"
 
 
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_isect_offset_encode_matches_torch(device):
+    """The searchsorted isect_offset_encode matches the torch reference, with
+    several images and empty tiles (the first, middle ones and the last)."""
+    from gsplat.cuda._torch_impl import _isect_offset_encode
+    from gsplat.cuda._wrapper import isect_offset_encode
+
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("no MPS device")
+    I, tw, th = 3, 7, 5
+    bits = (tw * th).bit_length()
+    g = torch.Generator(device="cpu").manual_seed(0)
+    tiles = torch.randint(1, tw * th - 1, (2000,), generator=g)
+    tiles = tiles[(tiles % 5) != 2]
+    images = torch.randint(0, I - 1, (tiles.numel(),), generator=g)  # the last image is empty
+    depths = torch.randint(0, 2**31, (tiles.numel(),), generator=g)
+    ids = (((images << bits) | tiles) << 32 | depths).sort().values.to(device)
+    expected = _isect_offset_encode(ids, I, tw, th)
+    got = isect_offset_encode(ids, I, tw, th)
+    assert got.dtype == expected.dtype
+    assert torch.equal(got.cpu(), expected.cpu())
+
+
 @pytest.mark.skipif(
     not is_metal_available(),
     reason="torch.mps.compile_shader unavailable on this build",
