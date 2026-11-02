@@ -18,9 +18,8 @@
 //     for "count done threads in the threadgroup"). Instead each thread
 //     just early-stops its own loop. Worst case: tail threads idle while
 //     others finish — minor perf, identical correctness.
-//   * Channel count CDIM=3 is hard-coded for now. Stage 6.x can specialise
-//     for the other power-of-two channel counts the CUDA backend used to
-//     pad to (4/8/16/...).
+//   * The channel count CDIM is a compile-time constant, set per shader
+//     variant when it is loaded (`_load_cdim`).
 //   * `extern __shared__` becomes a fixed-size `threadgroup` buffer sized
 //     for the largest tile we support: tile_size <= 16, so block_size = 256.
 
@@ -55,7 +54,7 @@ kernel void rasterize_to_pixels_3dgs_fwd(
     device int*                 last_ids      [[buffer(2)]], // [I, H, W]
     device const packed_float2* means2d       [[buffer(3)]], // [I*N, 2] flat
     device const packed_float3* conics        [[buffer(4)]], // [I*N, 3] flat
-    device const float*         colors        [[buffer(5)]], // [I*N, CDIM] flat (CDIM=3)
+    device const float*         colors        [[buffer(5)]], // [I*N, CDIM] flat
     device const float*  opacities        [[buffer(6)]], // [I*N] flat
     device const int*    tile_offsets     [[buffer(7)]], // [I, tile_h, tile_w]
     device const int*    flatten_ids      [[buffer(8)]], // [n_isects]
@@ -69,7 +68,11 @@ kernel void rasterize_to_pixels_3dgs_fwd(
     uint3                lid              [[thread_position_in_threadgroup]],
     uint3                tg_id            [[threadgroup_position_in_grid]]
 ) {
-    constexpr uint CDIM = 3u;
+    // CDIM is set when the shader is compiled (see `_load_cdim` in _kernels.py).
+#ifndef CDIM_VALUE
+#define CDIM_VALUE 3
+#endif
+    constexpr uint CDIM = CDIM_VALUE;
 
     const uint image_id = gid.z;
     const uint tile_x = tg_id.x;
@@ -100,7 +103,8 @@ kernel void rasterize_to_pixels_3dgs_fwd(
     float T = 1.0f;
     int   cur_idx = 0;
     bool  done = !inside;
-    float pix_out[CDIM] = {0.0f, 0.0f, 0.0f};
+    float pix_out[CDIM];
+    for (uint k = 0; k < CDIM; ++k) pix_out[k] = 0.0f;
 
     // Direct device-memory reads (no threadgroup cache). Slower than the
     // CUDA tile cache but trivially correct. Stage 6.x will reintroduce a
@@ -125,9 +129,7 @@ kernel void rasterize_to_pixels_3dgs_fwd(
             const float next_T = T * max(1.0f - alpha, 1e-7f);
             const float vis = alpha * T;
             const uint c_off = (uint)g * CDIM;
-            pix_out[0] += colors[c_off + 0] * vis;
-            pix_out[1] += colors[c_off + 1] * vis;
-            pix_out[2] += colors[c_off + 2] * vis;
+            for (uint k = 0; k < CDIM; ++k) pix_out[k] += colors[c_off + k] * vis;
             cur_idx = idx;
             T = next_T;
         }
@@ -136,9 +138,7 @@ kernel void rasterize_to_pixels_3dgs_fwd(
     if (inside) {
         const uint pix_base = image_id * image_height * image_width + pix_id;
         render_alphas[pix_base] = 1.0f - T;
-        render_colors[pix_base * CDIM + 0] = pix_out[0];
-        render_colors[pix_base * CDIM + 1] = pix_out[1];
-        render_colors[pix_base * CDIM + 2] = pix_out[2];
+        for (uint k = 0; k < CDIM; ++k) render_colors[pix_base * CDIM + k] = pix_out[k];
         last_ids[pix_base] = cur_idx;
     }
 }

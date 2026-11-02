@@ -1096,7 +1096,7 @@ def rasterize_to_pixels(
         )
 
     # Phase B: route MPS tensors through the native Metal kernel when the
-    # input shape matches what the kernel supports (CDIM=3, tile_size=16,
+    # input shape matches what the kernel supports (up to 32 channels, tile_size=16,
     # no backgrounds / no masks). Anything else falls back to the torch
     # rasterizer below.
     from ._dispatch import select_backend, Backend
@@ -1104,7 +1104,7 @@ def rasterize_to_pixels(
     if (
         select_backend(means2d, "rasterize_to_pixels_3dgs_fwd") is Backend.METAL
         and tile_size == 16
-        and channels == 3
+        and colors.shape[-1] <= 32  # channels after padding
         and not packed
         and backgrounds is None
         and masks is None

@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from ._kernels import _load
+from ._kernels import _load_cdim
 
 
 _TILE_SIZE = 16  # must match TILE_SIZE in rasterize_to_pixels_3dgs_fwd.metal
@@ -23,7 +23,7 @@ _TILE_SIZE = 16  # must match TILE_SIZE in rasterize_to_pixels_3dgs_fwd.metal
 def _rasterize_to_pixels_3dgs_fwd_metal(
     means2d: Tensor,  # [I, N, 2]  fp32, mps
     conics: Tensor,  # [I, N, 3]
-    colors: Tensor,  # [I, N, 3] (CDIM=3 only for now)
+    colors: Tensor,  # [I, N, C]
     opacities: Tensor,  # [I, N]
     backgrounds: Optional[Tensor],  # [I, 3] or None
     masks: Optional[Tensor],  # [I, tile_h, tile_w] bool or None
@@ -35,11 +35,11 @@ def _rasterize_to_pixels_3dgs_fwd_metal(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Launch the Metal forward kernel. Returns (colors, alphas, last_ids).
 
-    All inputs must be MPS tensors. The kernel is hard-coded to `tile_size=16`
-    and `CDIM=3`; callers fall back to the torch path otherwise.
+    All inputs must be MPS tensors. The kernel is hard-coded to `tile_size=16`;
+    it is compiled once for each channel count C.
     """
     assert tile_size == _TILE_SIZE, f"only tile_size={_TILE_SIZE} is supported"
-    assert colors.shape[-1] == 3, "Stage-6 Metal kernel hard-codes CDIM=3"
+    C = colors.shape[-1]
     assert means2d.dim() == 3, "packed mode not supported in Metal forward yet"
 
     I, N = means2d.shape[0], means2d.shape[1]
@@ -60,18 +60,18 @@ def _rasterize_to_pixels_3dgs_fwd_metal(
     # what we need.
     means2d_flat = means2d.contiguous().reshape(I * N, 2)
     conics_flat = conics.contiguous().reshape(I * N, 3)
-    colors_flat = colors.contiguous().reshape(I * N, 3)
+    colors_flat = colors.contiguous().reshape(I * N, C)
     opacities_flat = opacities.contiguous().reshape(I * N)
 
     tile_offsets_i32 = tile_offsets.to(torch.int32).contiguous()
     flatten_ids_i32 = flatten_ids.to(torch.int32).contiguous()
 
-    render_colors = torch.zeros(I, H, W, 3, device=means2d.device, dtype=torch.float32)
+    render_colors = torch.zeros(I, H, W, C, device=means2d.device, dtype=torch.float32)
     render_alphas = torch.zeros(I, H, W, 1, device=means2d.device, dtype=torch.float32)
     last_ids = torch.zeros(I, H, W, device=means2d.device, dtype=torch.int32)
 
     n_isects = int(flatten_ids.numel())
-    lib = _load("rasterize_to_pixels_3dgs_fwd")
+    lib = _load_cdim("rasterize_to_pixels_3dgs_fwd", C)
     lib.rasterize_to_pixels_3dgs_fwd(
         render_colors,
         render_alphas,
@@ -97,13 +97,13 @@ def _rasterize_to_pixels_3dgs_fwd_metal(
 def _rasterize_to_pixels_3dgs_bwd_metal(
     means2d: Tensor,  # [I, N, 2]
     conics: Tensor,  # [I, N, 3]
-    colors: Tensor,  # [I, N, 3]
+    colors: Tensor,  # [I, N, C]
     opacities: Tensor,  # [I, N]
     tile_offsets: Tensor,  # [I, tile_h, tile_w]
     flatten_ids: Tensor,  # [n_isects]
     render_alphas: Tensor,  # [I, H, W, 1]
     last_ids: Tensor,  # [I, H, W]
-    v_render_colors: Tensor,  # [I, H, W, 3]
+    v_render_colors: Tensor,  # [I, H, W, C]
     v_render_alphas: Tensor,  # [I, H, W, 1]
     image_width: int,
     image_height: int,
@@ -116,29 +116,29 @@ def _rasterize_to_pixels_3dgs_bwd_metal(
     zero-initialized then accumulated in place.
     """
     assert tile_size == _TILE_SIZE
-    assert colors.shape[-1] == 3
+    C = colors.shape[-1]
     I, N = means2d.shape[0], means2d.shape[1]
     H, W = image_height, image_width
     tile_h, tile_w = tile_offsets.shape[-2:]
 
     means2d_flat = means2d.contiguous().reshape(I * N, 2)
     conics_flat = conics.contiguous().reshape(I * N, 3)
-    colors_flat = colors.contiguous().reshape(I * N, 3)
+    colors_flat = colors.contiguous().reshape(I * N, C)
     opacities_flat = opacities.contiguous().reshape(I * N)
     tile_offsets_i32 = tile_offsets.to(torch.int32).contiguous()
     flatten_ids_i32 = flatten_ids.to(torch.int32).contiguous()
     render_alphas_flat = render_alphas.contiguous().reshape(I * H * W)
     last_ids_flat = last_ids.to(torch.int32).contiguous().reshape(I * H * W)
-    v_render_colors_flat = v_render_colors.contiguous().reshape(I * H * W * 3)
+    v_render_colors_flat = v_render_colors.contiguous().reshape(I * H * W * C)
     v_render_alphas_flat = v_render_alphas.contiguous().reshape(I * H * W)
 
     v_means2d = torch.zeros(I * N, 2, device=means2d.device, dtype=torch.float32)
     v_conics = torch.zeros(I * N, 3, device=means2d.device, dtype=torch.float32)
-    v_colors = torch.zeros(I * N, 3, device=means2d.device, dtype=torch.float32)
+    v_colors = torch.zeros(I * N, C, device=means2d.device, dtype=torch.float32)
     v_opacities = torch.zeros(I * N, device=means2d.device, dtype=torch.float32)
 
     n_isects = int(flatten_ids.numel())
-    lib = _load("rasterize_to_pixels_3dgs_bwd")
+    lib = _load_cdim("rasterize_to_pixels_3dgs_bwd", C)
     lib.rasterize_to_pixels_3dgs_bwd(
         v_means2d,
         v_conics,
@@ -167,7 +167,7 @@ def _rasterize_to_pixels_3dgs_bwd_metal(
     return (
         v_means2d.reshape(I, N, 2),
         v_conics.reshape(I, N, 3),
-        v_colors.reshape(I, N, 3),
+        v_colors.reshape(I, N, C),
         v_opacities.reshape(I, N),
     )
 

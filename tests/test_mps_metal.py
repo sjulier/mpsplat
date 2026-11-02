@@ -95,8 +95,10 @@ def test_rasterize_to_pixels_3dgs_fwd_metal_matches_torch():
     not is_metal_available(),
     reason="torch.mps.compile_shader unavailable on this build",
 )
-def test_rasterize_to_pixels_3dgs_bwd_metal_matches_torch():
-    """Stage 7: Metal backward grads match torch-autograd reference within tol."""
+@pytest.mark.parametrize("channels", [1, 3, 4, 8, 32])
+def test_rasterize_to_pixels_3dgs_bwd_metal_matches_torch(channels):
+    """Stage 7: Metal forward and backward match the torch reference, for any
+    channel count (4 = RGB+D, as pySLAM renders)."""
     from gsplat.cuda._torch_rasterize import _rasterize_to_pixels_torch
     from gsplat.mps._rasterize import _RasterizeToPixels3DGSMetal
 
@@ -107,8 +109,10 @@ def test_rasterize_to_pixels_3dgs_bwd_metal_matches_torch():
     m2d = (torch.rand(1, N, 2, generator=g) * torch.tensor([W, H])).to(device)
     conics = torch.full((1, N, 3), 0.05, device=device)
     conics[..., 1] = 0.0
-    colors = torch.rand(1, N, 3, generator=g).to(device)
+    colors = torch.rand(1, N, channels, generator=g).to(device)
     opacities = torch.full((1, N), 0.5, device=device)
+    w_img = torch.randn(1, H, W, channels, generator=g).to(device)
+    w_a = torch.randn(1, H, W, 1, generator=g).to(device)
 
     n_tiles = tile_h * tile_w
     n_per = max(1, N // n_tiles)
@@ -125,7 +129,7 @@ def test_rasterize_to_pixels_3dgs_bwd_metal_matches_torch():
     img_t, a_t = _rasterize_to_pixels_torch(
         m_t, c_t, col_t, op_t, W, H, tile_size, isect_offsets, flatten_ids
     )
-    (img_t.sum() + a_t.sum()).backward()
+    ((img_t * w_img).sum() + (a_t * w_a).sum()).backward()
 
     # Metal version — autograd.Function uses our Stage-7 Metal bwd kernel.
     m_m = m2d.clone().requires_grad_(True)
@@ -145,7 +149,10 @@ def test_rasterize_to_pixels_3dgs_bwd_metal_matches_torch():
         None,
         None,
     )
-    (img_m.sum() + a_m.sum()).backward()
+    ((img_m * w_img).sum() + (a_m * w_a).sum()).backward()
+
+    assert (img_t - img_m).abs().max().item() < 1e-5, "image"
+    assert (a_t - a_m).abs().max().item() < 1e-5, "alpha"
 
     # Plan tolerance: 5e-4. Conics see slightly more drift due to
     # atomic-reordering (each gauss receives many add-from-pixel ops).

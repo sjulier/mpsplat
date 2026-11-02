@@ -32,18 +32,18 @@ kernel void rasterize_to_pixels_3dgs_bwd(
     // gradient outputs (atomic — one per leaf input)
     device atomic_float*        v_means2d        [[buffer(0)]], // [I*N, 2] flat
     device atomic_float*        v_conics         [[buffer(1)]], // [I*N, 3] flat
-    device atomic_float*        v_colors         [[buffer(2)]], // [I*N, 3] flat
+    device atomic_float*        v_colors         [[buffer(2)]], // [I*N, CDIM] flat
     device atomic_float*        v_opacities      [[buffer(3)]], // [I*N] flat
     // forward inputs
     device const packed_float2* means2d          [[buffer(4)]],
     device const packed_float3* conics           [[buffer(5)]],
-    device const float*         colors           [[buffer(6)]], // [I*N, 3]
+    device const float*         colors           [[buffer(6)]], // [I*N, CDIM]
     device const float*         opacities        [[buffer(7)]], // [I*N]
     // forward outputs needed for the backward
     device const float*         render_alphas    [[buffer(8)]], // [I, H, W]
     device const int*           last_ids         [[buffer(9)]], // [I, H, W]
     // upstream gradients
-    device const float*         v_render_colors  [[buffer(10)]], // [I, H, W, 3]
+    device const float*         v_render_colors  [[buffer(10)]], // [I, H, W, CDIM]
     device const float*         v_render_alphas  [[buffer(11)]], // [I, H, W]
     // intersections
     device const int*           tile_offsets     [[buffer(12)]], // [I, th, tw]
@@ -58,7 +58,11 @@ kernel void rasterize_to_pixels_3dgs_bwd(
     uint3                       gid              [[thread_position_in_grid]],
     uint3                       tg_id            [[threadgroup_position_in_grid]]
 ) {
-    constexpr uint CDIM = 3u;
+    // CDIM is set when the shader is compiled (see `_load_cdim` in _kernels.py).
+#ifndef CDIM_VALUE
+#define CDIM_VALUE 3
+#endif
+    constexpr uint CDIM = CDIM_VALUE;
 
     const uint image_id = gid.z;
     const uint tile_id = tg_id.y * tile_width + tg_id.x;
@@ -85,15 +89,13 @@ kernel void rasterize_to_pixels_3dgs_bwd(
     // Per-pixel state from the forward.
     const float T_final = 1.0f - render_alphas[pix_base];
     float       T = T_final;
-    float       buffer[CDIM] = {0.0f, 0.0f, 0.0f};
+    float       buffer[CDIM];
+    for (uint k = 0; k < CDIM; ++k) buffer[k] = 0.0f;
     const int   bin_final = last_ids[pix_base];
 
     // Upstream gradient for this pixel.
-    const float v_render_c[CDIM] = {
-        v_render_colors[pix_base * CDIM + 0],
-        v_render_colors[pix_base * CDIM + 1],
-        v_render_colors[pix_base * CDIM + 2],
-    };
+    float v_render_c[CDIM];
+    for (uint k = 0; k < CDIM; ++k) v_render_c[k] = v_render_colors[pix_base * CDIM + k];
     const float v_render_a = v_render_alphas[pix_base];
 
     const float px = (float)pix_x + 0.5f;
@@ -125,16 +127,13 @@ kernel void rasterize_to_pixels_3dgs_bwd(
         const float fac = alpha * T;
 
         // Local gradient contributions for this (pixel, gaussian) pair.
-        float v_rgb_local[CDIM];
-        v_rgb_local[0] = fac * v_render_c[0];
-        v_rgb_local[1] = fac * v_render_c[1];
-        v_rgb_local[2] = fac * v_render_c[2];
+
 
         float v_alpha = 0.0f;
         const uint c_off = (uint)g * CDIM;
-        v_alpha += (colors[c_off + 0] * T - buffer[0] * ra) * v_render_c[0];
-        v_alpha += (colors[c_off + 1] * T - buffer[1] * ra) * v_render_c[1];
-        v_alpha += (colors[c_off + 2] * T - buffer[2] * ra) * v_render_c[2];
+        for (uint k = 0; k < CDIM; ++k) {
+            v_alpha += (colors[c_off + k] * T - buffer[k] * ra) * v_render_c[k];
+        }
         v_alpha += T_final * ra * v_render_a;
 
         float v_opacity_local = 0.0f;
@@ -151,14 +150,12 @@ kernel void rasterize_to_pixels_3dgs_bwd(
         }
 
         // Update the running back-buffer BEFORE the next iteration.
-        buffer[0] += colors[c_off + 0] * fac;
-        buffer[1] += colors[c_off + 1] * fac;
-        buffer[2] += colors[c_off + 2] * fac;
+        for (uint k = 0; k < CDIM; ++k) buffer[k] += colors[c_off + k] * fac;
 
         // Scatter gradients atomically.
-        atomic_fetch_add_explicit(v_colors + c_off + 0, v_rgb_local[0], memory_order_relaxed);
-        atomic_fetch_add_explicit(v_colors + c_off + 1, v_rgb_local[1], memory_order_relaxed);
-        atomic_fetch_add_explicit(v_colors + c_off + 2, v_rgb_local[2], memory_order_relaxed);
+        for (uint k = 0; k < CDIM; ++k) {
+            atomic_fetch_add_explicit(v_colors + c_off + k, fac * v_render_c[k], memory_order_relaxed);
+        }
 
         atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 0, v_conic_local_x, memory_order_relaxed);
         atomic_fetch_add_explicit(v_conics + (uint)g * 3 + 1, v_conic_local_y, memory_order_relaxed);

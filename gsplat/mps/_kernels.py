@@ -26,6 +26,15 @@ def _load(name: str):
     return torch.mps.compile_shader(source)
 
 
+@functools.lru_cache(maxsize=None)
+def _load_cdim(name: str, cdim: int):
+    """Like `_load`, for a shader whose channel count `CDIM_VALUE` is fixed at compile time."""
+    path = os.path.join(_SHADER_DIR, f"{name}.metal")
+    with open(path) as f:
+        source = f.read()
+    return torch.mps.compile_shader(f"#define CDIM_VALUE {int(cdim)}\n" + source)
+
+
 def elementwise_add(a: Tensor, b: Tensor) -> Tensor:
     """Toy kernel: `out = a + b`. Sanity test for the build pipeline."""
     assert a.shape == b.shape, (a.shape, b.shape)
