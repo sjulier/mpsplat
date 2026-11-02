@@ -61,6 +61,8 @@ kernel void projection_ewa_3dgs_fused_bwd(
     constant uint&              N              [[buffer(15)]],
     constant uint&              image_width    [[buffer(16)]],
     constant uint&              image_height   [[buffer(17)]],
+    // grad of the view matrices (atomic — summed over Gaussians), row-major
+    device atomic_float*        v_viewmats     [[buffer(18)]],  // [B*C, 16]
     uint                        idx            [[thread_position_in_grid]]
 ) {
     if (idx >= B * C * N) {
@@ -115,6 +117,10 @@ kernel void projection_ewa_3dgs_fused_bwd(
         }
     }
     v_mean_c.z += v_d;
+
+    // covar_c = R_view covar_w R_view^T, so its share of v_R_view is
+    // 2 v_covar_c R_view covar_w (both symmetric). Set in the conic chain.
+    float3x3 v_R_view = float3x3(0.0f);
 
     // Always run the conics-chain. For depth-culled gauss the forward emits
     // conics=(0,0,0); the -conics V conics formula then produces zero
@@ -269,6 +275,7 @@ kernel void projection_ewa_3dgs_fused_bwd(
         // Step 5: v_covar_c → v_covar_w  (R_view^T @ V @ R_view)
         const float3x3 RT = transpose(R_view);
         const float3x3 v_covar_w = RT * v_covar_c * R_view;
+        v_R_view = 2.0f * v_covar_c * R_view * covar_w;
 
         // Step 6: v_covar_w → v_M = 2 * v_covar_w @ M.
         const float3x3 v_M = 2.0f * v_covar_w * M;
@@ -356,4 +363,27 @@ kernel void projection_ewa_3dgs_fused_bwd(
     atomic_fetch_add_explicit(v_means + mn_off * 3 + 0, v_mean_w.x, memory_order_relaxed);
     atomic_fetch_add_explicit(v_means + mn_off * 3 + 1, v_mean_w.y, memory_order_relaxed);
     atomic_fetch_add_explicit(v_means + mn_off * 3 + 2, v_mean_w.z, memory_order_relaxed);
+
+    // Step 11: v_viewmats. mean_c = R_view mean_w + t_view adds
+    // v_mean_c mean_w^T to v_R_view and v_mean_c to v_t_view. Every thread
+    // writes to the same 12 entries of its camera, so sum over the SIMD group
+    // first when the whole group is on one camera (the usual case).
+    v_R_view += float3x3(v_mean_c * mean_w.x, v_mean_c * mean_w.y, v_mean_c * mean_w.z);
+    const uint cam = bid * C + cid;
+    const bool one_cam = simd_all(cam == simd_broadcast_first(cam));
+    device atomic_float* v_vm = v_viewmats + cam * 16u;
+    for (uint i = 0; i < 3; ++i) {
+        // row i of [R | t]; v_R_view is stored by columns
+        const float4 row = float4(v_R_view[0][i], v_R_view[1][i], v_R_view[2][i], v_mean_c[i]);
+        for (uint j = 0; j < 4; ++j) {
+            if (one_cam) {
+                const float sum = simd_sum(row[j]);
+                if (simd_is_first()) {
+                    atomic_fetch_add_explicit(v_vm + i * 4u + j, sum, memory_order_relaxed);
+                }
+            } else {
+                atomic_fetch_add_explicit(v_vm + i * 4u + j, row[j], memory_order_relaxed);
+            }
+        }
+    }
 }

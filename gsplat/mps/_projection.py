@@ -110,8 +110,8 @@ def _projection_ewa_3dgs_fused_bwd_metal(
     v_conics: Tensor,  # [B, C, N, 3]
     image_width: int,
     image_height: int,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """Returns (v_means [B,N,3], v_quats [B,N,4], v_scales [B,N,3])."""
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Returns (v_means [B,N,3], v_quats [B,N,4], v_scales [B,N,3], v_viewmats [B,C,4,4])."""
     assert means.device.type == "mps"
     B, N = means.shape[0], means.shape[1]
     C = viewmats.shape[1]
@@ -131,6 +131,7 @@ def _projection_ewa_3dgs_fused_bwd_metal(
     v_means_out = torch.zeros(B * N, 3, device=device, dtype=torch.float32)
     v_quats_out = torch.zeros(B * N, 4, device=device, dtype=torch.float32)
     v_scales_out = torch.zeros(B * N, 3, device=device, dtype=torch.float32)
+    v_viewmats_out = torch.zeros(B * C, 16, device=device, dtype=torch.float32)
 
     total = B * C * N
     lib = _load("projection_ewa_3dgs_fused_bwd")
@@ -153,6 +154,7 @@ def _projection_ewa_3dgs_fused_bwd_metal(
         N,
         image_width,
         image_height,
+        v_viewmats_out,
         threads=(total,),
         group_size=(min(total, 256),),
     )
@@ -160,6 +162,7 @@ def _projection_ewa_3dgs_fused_bwd_metal(
         v_means_out.reshape(B, N, 3),
         v_quats_out.reshape(B, N, 4),
         v_scales_out.reshape(B, N, 3),
+        v_viewmats_out.reshape(B, C, 4, 4),
     )
 
 
@@ -212,7 +215,7 @@ class _FullyFusedProjection3DGSMetal(torch.autograd.Function):
             v_depths = torch.zeros(*radii.shape[:-1], device=radii.device, dtype=torch.float32)
         if v_conics is None:
             v_conics = torch.zeros_like(conics)
-        v_means, v_quats, v_scales = _projection_ewa_3dgs_fused_bwd_metal(
+        v_means, v_quats, v_scales, v_viewmats = _projection_ewa_3dgs_fused_bwd_metal(
             means, quats, scales, viewmats, Ks,
             radii, conics,
             v_means2d, v_depths, v_conics,
@@ -222,7 +225,7 @@ class _FullyFusedProjection3DGSMetal(torch.autograd.Function):
             v_means,
             v_quats,
             v_scales,
-            None,  # viewmats
+            v_viewmats if ctx.needs_input_grad[3] else None,
             None,  # Ks
             None,  # image_width
             None,  # image_height

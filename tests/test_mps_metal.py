@@ -3,6 +3,8 @@
 
 """Stage-5 smoke: torch.mps.compile_shader compiles + dispatches a kernel."""
 
+import math
+
 import pytest
 import torch
 
@@ -445,8 +447,11 @@ def test_spherical_harmonics_bwd_metal_matches_torch(deg):
     not is_metal_available(),
     reason="torch.mps.compile_shader unavailable on this build",
 )
-def test_projection_ewa_3dgs_fused_bwd_metal_matches_torch():
-    """Deferred-stage 5: Metal projection_ewa bwd matches torch ref autograd."""
+@pytest.mark.parametrize("C,N", [(1, 32), (2, 50)])
+def test_projection_ewa_3dgs_fused_bwd_metal_matches_torch(C, N):
+    """Deferred-stage 5: Metal projection_ewa bwd matches torch ref autograd,
+    including the view-matrix gradient (pose refinement). With N=50 and two
+    cameras some SIMD groups hold Gaussians of both cameras."""
     from gsplat.cuda._math import _quat_scale_to_covar_preci
     from gsplat.cuda._torch_impl import _fully_fused_projection
     from gsplat.mps._projection import (
@@ -456,15 +461,21 @@ def test_projection_ewa_3dgs_fused_bwd_metal_matches_torch():
 
     device = "mps"
     g = torch.Generator(device="cpu").manual_seed(7)
-    B, C, N, H, W = 1, 1, 32, 128, 128
+    B, H, W = 1, 128, 128
     means = (torch.randn(B, N, 3, generator=g) * 0.5).to(device).requires_grad_()
     raw_q = torch.randn(B, N, 4, generator=g).to(device).requires_grad_()
     scales = (torch.rand(B, N, 3, generator=g) * 0.1 + 0.02).to(device).requires_grad_()
-    viewmats = torch.eye(4)[None, None].clone().to(device)
-    viewmats[..., :3, 3] = torch.tensor([0.0, 0.0, 2.0], device=device)
+    viewmats = torch.eye(4).repeat(B, C, 1, 1)
+    for c in range(C):  # a small rotation about y, different for each camera
+        a = 0.1 + 0.2 * c
+        viewmats[0, c, :3, :3] = torch.tensor(
+            [[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]]
+        )
+        viewmats[0, c, :3, 3] = torch.tensor([0.05 * c, -0.02, 2.0])
+    viewmats = viewmats.to(device).requires_grad_()
     Ks = torch.tensor(
         [[100.0, 0, 64.0], [0, 100.0, 64.0], [0, 0, 1.0]], device=device
-    ).reshape(1, 1, 3, 3)
+    ).reshape(1, 1, 3, 3).repeat(B, C, 1, 1)
     eps2d = 0.3
 
     qn = raw_q / raw_q.norm(dim=-1, keepdim=True)
@@ -480,20 +491,20 @@ def test_projection_ewa_3dgs_fused_bwd_metal_matches_torch():
     g_c = torch.randn_like(conics_t)
     grads_t = torch.autograd.grad(
         (m2d_t * g_m2d).sum() + (d_t * g_d).sum() + (conics_t * g_c).sum(),
-        [means, raw_q, scales], retain_graph=False, allow_unused=True,
+        [means, raw_q, scales, viewmats], retain_graph=False, allow_unused=True,
     )
 
     radii_m, _, _, conics_m = _projection_ewa_3dgs_fused_fwd_metal(
-        means.detach(), raw_q.detach(), scales.detach(), viewmats, Ks,
+        means.detach(), raw_q.detach(), scales.detach(), viewmats.detach(), Ks,
         W, H, eps2d, 0.01, 1e10, 0.0, None,
     )
-    v_means, v_quats, v_scales = _projection_ewa_3dgs_fused_bwd_metal(
-        means.detach(), raw_q.detach(), scales.detach(), viewmats, Ks,
+    v_means, v_quats, v_scales, v_viewmats = _projection_ewa_3dgs_fused_bwd_metal(
+        means.detach(), raw_q.detach(), scales.detach(), viewmats.detach(), Ks,
         radii_m, conics_m, g_m2d, g_d, g_c, W, H,
     )
 
-    grads_m = [v_means, v_quats, v_scales]
-    names = ["v_means", "v_quats", "v_scales"]
+    grads_m = [v_means, v_quats, v_scales, v_viewmats]
+    names = ["v_means", "v_quats", "v_scales", "v_viewmats"]
     # Atomic-add ordering + fp32 amplifies absolute error proportionally to
     # leaf magnitude. Worst grad is v_means O(150); 1e-3 absolute = 7e-6 rel.
     for name, gt, gm in zip(names, grads_t, grads_m):
