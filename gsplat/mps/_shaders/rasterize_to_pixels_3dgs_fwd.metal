@@ -28,7 +28,8 @@ using namespace metal;
 
 constant constexpr uint TILE_SIZE   = 16u;
 constant constexpr uint BLOCK_SIZE  = TILE_SIZE * TILE_SIZE;
-constant constexpr float MAX_ALPHA              = 0.99f;
+// As gsplat 1.5.3 CUDA (RasterizeToPixels3DGSFwd.cu).
+constant constexpr float MAX_ALPHA              = 0.999f;
 constant constexpr float ALPHA_THRESHOLD        = 1.0f / 255.0f;
 constant constexpr float TRANSMITTANCE_THRESHOLD = 1e-4f;
 
@@ -121,12 +122,14 @@ kernel void rasterize_to_pixels_3dgs_fwd(
             const float dy = xy.y - py;
             const float sigma =
                 0.5f * (cn.x * dx * dx + cn.z * dy * dy) + cn.y * dx * dy;
-            float alpha = opac * exp(-sigma);
-            alpha = min(MAX_ALPHA, alpha);
-            if (sigma < 0.0f) {
-                alpha = 0.0f;
+            const float alpha = min(MAX_ALPHA, opac * exp(-sigma));
+            if (sigma < 0.0f || alpha < ALPHA_THRESHOLD) {
+                continue;
             }
-            const float next_T = T * max(1.0f - alpha, 1e-7f);
+            const float next_T = T * (1.0f - alpha);
+            if (next_T <= TRANSMITTANCE_THRESHOLD) {
+                break;  // this pixel is done; the gaussian is not composited
+            }
             const float vis = alpha * T;
             const uint c_off = (uint)g * CDIM;
             for (uint k = 0; k < CDIM; ++k) pix_out[k] += colors[c_off + k] * vis;

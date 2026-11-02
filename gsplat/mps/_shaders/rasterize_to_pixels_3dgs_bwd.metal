@@ -13,17 +13,16 @@
 //   * No threadgroup cache yet — each thread reads gaussian state directly
 //     from device memory. Stage 7.x can add a cache once the baseline is
 //     verified to match the torch reference within tolerance.
-//   * `MAX_ALPHA` and `ALPHA_THRESHOLD` semantics match the *forward*
-//     kernel's relaxed flavour (no alpha-threshold cull, no early-exit) —
-//     the forward stays paired with its bwd; if Stage 7.x reintroduces
-//     CUDA's optimisations both kernels move together.
+//   * `MAX_ALPHA`, `ALPHA_THRESHOLD` and the early exit (via last_ids) are
+//     those of the forward kernel, and of gsplat 1.5.3 CUDA.
 
 #include <metal_stdlib>
 using namespace metal;
 
 constant constexpr uint  TILE_SIZE              = 16u;
 constant constexpr uint  BLOCK_SIZE             = TILE_SIZE * TILE_SIZE;
-constant constexpr float MAX_ALPHA              = 0.99f;
+constant constexpr float MAX_ALPHA              = 0.999f;
+constant constexpr float ALPHA_THRESHOLD        = 1.0f / 255.0f;
 constant constexpr float MIN_ONE_MINUS_ALPHA    = 1e-7f;
 
 kernel void rasterize_to_pixels_3dgs_bwd(
@@ -125,17 +124,15 @@ kernel void rasterize_to_pixels_3dgs_bwd(
         float v_xy_local_x = 0.0f, v_xy_local_y = 0.0f;
         float v_conic_local_x = 0.0f, v_conic_local_y = 0.0f, v_conic_local_z = 0.0f;
 
-        if (valid) {
-            const float dx = xy.x - px;
-            const float dy = xy.y - py;
-            const float sigma = 0.5f * (cn.x * dx * dx + cn.z * dy * dy)
-                              + cn.y * dx * dy;
-            const float vis = exp(-sigma);
-            float alpha = min(MAX_ALPHA, opac * vis);
-            if (sigma < 0.0f) {
-                alpha = 0.0f;
-            }
+        const float dx = xy.x - px;
+        const float dy = xy.y - py;
+        const float sigma = 0.5f * (cn.x * dx * dx + cn.z * dy * dy)
+                          + cn.y * dx * dy;
+        const float vis = exp(-sigma);
+        const float alpha = min(MAX_ALPHA, opac * vis);
 
+        // gaussians the forward skipped contribute nothing
+        if (valid && sigma >= 0.0f && alpha >= ALPHA_THRESHOLD) {
             // Rewind transmittance: T_at_g = T_after_g / (1 - alpha)
             const float ra = 1.0f / max(MIN_ONE_MINUS_ALPHA, 1.0f - alpha);
             T *= ra;

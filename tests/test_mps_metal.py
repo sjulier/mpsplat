@@ -190,6 +190,56 @@ def test_intersect_tile_metal_matches_torch():
     assert torch.equal(fid_t, fid_m), "flatten_ids"
 
 
+@pytest.mark.skipif(
+    not is_metal_available(),
+    reason="torch.mps.compile_shader unavailable on this build",
+)
+def test_rasterize_to_pixels_3dgs_metal_cuda_rules():
+    """gsplat 1.5.3 CUDA's rules, in the Metal kernels and the torch rasterizer:
+    alpha <= 0.999, gaussians with alpha < 1/255 are skipped, and a pixel stops
+    before its transmittance reaches 1e-4. 40 overlapping gaussians in one tile
+    (every 5th too faint to count) take every pixel past the stop."""
+    from gsplat.cuda._torch_rasterize import _rasterize_to_pixels_torch
+    from gsplat.mps._rasterize import _RasterizeToPixels3DGSMetal
+
+    device = "mps"
+    N, H, W, channels, tile_size = 40, 16, 16, 4, 16
+    g = torch.Generator(device="cpu").manual_seed(3)
+    m2d = (4.0 + 8.0 * torch.rand(1, N, 2, generator=g)).to(device)
+    conics = torch.tensor([0.02, 0.003, 0.03]).repeat(1, N, 1).to(device)
+    opacities = 0.3 + 0.69 * torch.rand(1, N, generator=g)
+    opacities[0, ::5] = 0.003  # below 1/255
+    opacities = opacities.to(device)
+    colors = torch.rand(1, N, channels, generator=g).to(device)
+    w_img = torch.randn(1, H, W, channels, generator=g).to(device)
+    w_a = torch.randn(1, H, W, 1, generator=g).to(device)
+    flatten_ids = torch.arange(N, device=device, dtype=torch.int32)
+    isect_offsets = torch.zeros(1, 1, 1, device=device, dtype=torch.int32)
+
+    out = {}
+    for name in ("torch", "metal"):
+        leaves = [x.clone().requires_grad_(True) for x in (m2d, conics, colors, opacities)]
+        if name == "torch":
+            img, a = _rasterize_to_pixels_torch(*leaves, W, H, tile_size, isect_offsets, flatten_ids)
+        else:
+            img, a = _RasterizeToPixels3DGSMetal.apply(
+                *leaves, W, H, tile_size, isect_offsets, flatten_ids, None, None
+            )
+        ((img * w_img).sum() + (a * w_a).sum()).backward()
+        out[name] = [img, a] + [x.grad for x in leaves]
+
+    # every pixel stopped early: without the stop, T would be ~1e-13
+    assert (1.0 - out["metal"][1]).min().item() > 1e-4
+    # the faint gaussians got no gradient
+    assert out["metal"][5][0, ::5].abs().max().item() == 0.0
+    # The Metal backward rewinds T by dividing by (1 - alpha) at each of the
+    # deep, nearly opaque layers, which costs a few float32 digits.
+    names = ["image", "alpha", "means2d", "conics", "colors", "opacities"]
+    for name, t, m in zip(names, out["torch"], out["metal"]):
+        rel = (t - m).abs().max().item() / (t.abs().max().item() + 1e-12)
+        assert rel < 1e-3, f"{name}: rel diff {rel:.3e}"
+
+
 @pytest.mark.parametrize("device", ["cpu", "mps"])
 def test_isect_offset_encode_matches_torch(device):
     """The searchsorted isect_offset_encode matches the torch reference, with

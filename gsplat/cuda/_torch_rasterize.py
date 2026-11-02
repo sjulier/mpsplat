@@ -16,7 +16,10 @@ import math
 import torch
 from torch import Tensor
 
-from ._constants import MAX_ALPHA
+from ._constants import ALPHA_THRESHOLD, MAX_ALPHA, TRANSMITTANCE_THRESHOLD
+
+# the 3DGS rasterizer clamps alpha at 0.999, as gsplat 1.5.3 CUDA does
+_MAX_ALPHA_3DGS = 0.999
 
 
 def _rasterize_to_pixels_torch(
@@ -106,8 +109,17 @@ def _rasterize_to_pixels_torch(
                 cn[:, 0, None, None] * delta[..., 0] ** 2
                 + cn[:, 2, None, None] * delta[..., 1] ** 2
             ) + cn[:, 1, None, None] * delta[..., 0] * delta[..., 1]  # [k, ph, pw]
-            alpha = (op[:, None, None] * torch.exp(-sigma)).clamp(max=MAX_ALPHA)
-            alpha = torch.where(sigma < 0, torch.zeros_like(alpha), alpha)
+            # gsplat 1.5.3 CUDA's rules: alpha <= 0.999; skip a gaussian with
+            # sigma < 0 or alpha < 1/255; a pixel stops before the gaussian
+            # that would take its transmittance to 1e-4 or below.
+            alpha = (op[:, None, None] * torch.exp(-sigma)).clamp(max=_MAX_ALPHA_3DGS)
+            skip = (sigma < 0) | (alpha < ALPHA_THRESHOLD)
+            alpha = torch.where(skip, torch.zeros_like(alpha), alpha)
+            with torch.no_grad():
+                # transmittance after each gaussian; non-increasing, so `keep`
+                # is a prefix along k
+                keep = torch.cumprod(1.0 - alpha, dim=0) > TRANSMITTANCE_THRESHOLD
+            alpha = alpha * keep
 
             # Front-to-back compositing along the leading "k" axis.
             # T_i = ∏_{j<i} (1 - α_j)  →  use cumulative product of (1 - α).
