@@ -16,6 +16,8 @@ RTX 5090.
 python pyslam/reference.py compare --device mps   # against the CUDA reference
 python pyslam/reference.py fd --device mps        # finite differences, needs no reference
 python pyslam/reference.py speed --device mps     # forward+backward ms at 640x480, 100k and 300k Gaussians
+python pyslam/viewer.py                           # a live window: an orbiting render (RGB, depth, alpha) and
+                                                  # a MonoGS-style tracker that follows the camera from the images
 ```
 
 On CUDA (RTX 5090), 2 Nov 2026:
